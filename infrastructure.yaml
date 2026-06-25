@@ -1,0 +1,116 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: PredictaCart - Full ML Pipeline Infrastructure
+
+Parameters:
+  ModelDataUrl:
+    Type: String
+    Default: s3://predictacart-model-artifacts/model.tar.gz
+
+Resources:
+
+  # 1. S3 BUCKETS
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: predictacart-raw-data-2025
+
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: predictacart-processed-data-2025
+
+  PredictionsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: predictacart-predictions-2025
+
+  FeedbackBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: predictacart-feedback-2025
+
+  # 2. IAM ROLE FOR LAMBDA
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PredictaCartLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+        - arn:aws:iam::aws:policy/AmazonSQSFullAccess
+
+  # 3. LAMBDA - DATA VALIDATION
+  ValidationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: predictacart-validate
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, json
+          s3 = boto3.client('s3')
+          EXPECTED_COLUMNS = 15
+
+          def handler(event, context):
+              for record in event['Records']:
+                  src_bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+                  obj = s3.get_object(Bucket=src_bucket, Key=key)
+                  lines = obj['Body'].read().decode().strip().split('\n')
+                  cols = len(lines[0].split(','))
+                  if cols == EXPECTED_COLUMNS:
+                      s3.copy_object(
+                          Bucket='predictacart-processed-data-2025',
+                          CopySource={'Bucket': src_bucket, 'Key': key},
+                          Key=key
+                      )
+                      print(f"Valid: {key} moved to processed-data")
+                  else:
+                      print(f"Invalid: {key} has {cols} columns, expected {EXPECTED_COLUMNS}")
+
+  # 4. SQS QUEUE
+  FeedbackQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: predictacart-feedback-queue
+
+  # 5. LAMBDA - FEEDBACK
+  FeedbackLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: predictacart-feedback
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, json, datetime
+          s3 = boto3.client('s3')
+
+          def handler(event, context):
+              for record in event['Records']:
+                  body = json.loads(record['body'])
+                  key = f"clicks/{datetime.datetime.utcnow().isoformat()}.json"
+                  s3.put_object(
+                      Bucket='predictacart-feedback-2025',
+                      Key=key,
+                      Body=json.dumps(body)
+                  )
+                  print(f"Click event saved: {key}")
+
+Outputs:
+  RawDataBucket:
+    Value: !Ref RawDataBucket
+  ValidationLambda:
+    Value: !Ref ValidationLambda
+  FeedbackQueue:
+    Value: !Ref FeedbackQueue
